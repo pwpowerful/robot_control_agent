@@ -1,0 +1,51 @@
+"""Database metadata, ORM models, and migration-facing exports."""
+
+from robot_control_backend.database.base import Base, NAMING_CONVENTION, SoftDeleteMixin, TimestampMixin
+from robot_control_backend.database.models import (
+    AlertModel,
+    ArtifactReferenceModel,
+    AuditRecordModel,
+    ExecutionPlanModel,
+    ExecutionResultModel,
+    KnowledgeItemModel,
+    LongTermMemoryModel,
+    RobotConfigModel,
+    RoleModel,
+    SafetyRuleSetModel,
+    SemanticActionPlanModel,
+    SessionModel,
+    SystemConfigModel,
+    TaskModel,
+    TeachingSampleModel,
+    UserModel,
+    UserRoleModel,
+)
+from robot_control_backend.database.types import DEFAULT_VECTOR_DIMENSIONS, Vector, enum_values, sql_enum
+
+__all__ = [
+    "AlertModel",
+    "ArtifactReferenceModel",
+    "AuditRecordModel",
+    "Base",
+    "DEFAULT_VECTOR_DIMENSIONS",
+    "ExecutionPlanModel",
+    "ExecutionResultModel",
+    "KnowledgeItemModel",
+    "LongTermMemoryModel",
+    "NAMING_CONVENTION",
+    "RobotConfigModel",
+    "RoleModel",
+    "SafetyRuleSetModel",
+    "SemanticActionPlanModel",
+    "SessionModel",
+    "SoftDeleteMixin",
+    "SystemConfigModel",
+    "TaskModel",
+    "TeachingSampleModel",
+    "TimestampMixin",
+    "UserModel",
+    "UserRoleModel",
+    "Vector",
+    "enum_values",
+    "sql_enum",
+]

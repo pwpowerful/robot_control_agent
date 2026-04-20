@@ -129,9 +129,26 @@ MVP Web 控制台至少包含以下能力：
 
 若指令缺少关键要素，系统应在任务进入执行前给出结构化失败原因，而不是进入模糊执行。
 
+#### Agent 运行时分层
+
+MVP 的核心不是单个“大模型模块”，而是一个由编排器驱动的 Agent Runtime。其边界定义如下：
+
+- `Orchestrator Layer`：`Executor Worker / Orchestrator` 负责任务生命周期、上下文装配、状态流转、重试控制、内部回退策略、Tool 调用路由、权限校验与安全门禁，但不承担 Planner / Coder / Critic 的智能决策，也不替 Agent 决定调用哪个 Tool。
+- `Agent Layer`：`BaseAgent` 定义共享输入输出契约、上下文装配接口与审计元信息，`Planner Agent`、`Coder Agent`、`Critic Agent` 继承 `BaseAgent` 并分别负责规划、执行计划生成与执行前校验。
+- `Tool Layer`：`VisionTool` 与 `RobotTool` 是 Agent loop 中可调用的工具能力，分别提供环境感知、结果复检与底层执行能力。是否调用 Tool、调用哪个 Tool、在何时调用由 Agent 决定；Orchestrator 负责实际调用路由、权限校验、安全治理与审计记录。
+- `Memory Layer`：知识检索、短期记忆与长期记忆共同构成 Agent memory 子系统，为三个 Agent 提供上下文、约束与经验回写能力。长期记忆只能作为软参考，不得覆盖硬约束。
+- `Audit Layer`：审计与告警贯穿上述各层，记录每次上下文装配、工具调用、Agent 输出与记忆写入结果。
+
+MVP 中 Tool 请求权限矩阵固定为：
+
+- `Planner Agent` 可请求 `VisionTool`。
+- `Coder Agent` 主要消费 `Memory Layer`，不直接请求 `RobotTool`。
+- `Critic Agent` 可请求补充 `VisionTool` 以获取额外事实依据。
+- `RobotTool` 只能在 `Critic Agent` 放行后，由 `Orchestrator` 路由执行。
+
 ### 5.2 VisionTool
 
-VisionTool 是系统感知物理世界的入口，负责在任务执行前后提供视觉闭环支持。
+VisionTool 是 `Tool Layer` 中面向物理世界的感知工具。Agent 可根据任务阶段决定是否请求调用 VisionTool，Orchestrator 负责路由调用并将结构化观察结果回填给 Planner Agent、Critic Agent 与任务审计链路。
 
 MVP 中 VisionTool 包含两类能力：
 
@@ -149,9 +166,28 @@ MVP 中 VisionTool 包含两类能力：
 - 确认目标物是否已经处于预期位置。
 - 输出结构化确认结果，用于决定任务成功或失败。
 
-### 5.3 Planner
+VisionTool 的结构化返回契约至少包含：
 
-Planner 负责将自然语言任务转化为受控动作步骤。MVP 中 Planner 只面向定点抓取放置场景，输出的逻辑步骤必须可被约束在预定义动作模板内。
+- 目标候选列表。
+- 候选目标置信度。
+- 坐标系与坐标映射信息。
+- 风险目标列表。
+- 最终选中目标。
+- 执行后复检结论。
+
+VisionTool 的坐标与姿态规范固定为：
+
+- 最终执行坐标统一映射到机械臂 `base frame`。
+- 长度单位统一为 `mm`。
+- 姿态统一表示为 `x, y, z, rx, ry, rz`。
+
+### 5.3 Planner Agent
+
+在当前 MVP 中，`Planner Agent`、`Coder Agent`、`Critic Agent` 是三个串行协作的核心 Agent 角色，由执行编排器统一驱动，并共享 `BaseAgent` 的上下文、审计和输出契约。
+
+Planner Agent 负责将自然语言任务转化为受控动作步骤。它消费由编排器装配的任务输入、VisionTool 观察结果以及 Memory Layer 提供的 SOP、SDK 约束和历史经验。MVP 中 Planner Agent 只面向定点抓取放置场景，输出的逻辑步骤必须可被约束在预定义动作模板内。
+
+Planner Agent 的标准输出命名为“语义动作计划”，用于表达任务层面的语义步骤，而不是直接面向底层 SDK 的执行原语。
 
 典型步骤包括：
 
@@ -164,7 +200,7 @@ Planner 负责将自然语言任务转化为受控动作步骤。MVP 中 Planner
 7. 松开夹爪。
 8. 退出安全位置。
 
-Planner 同时需要在规划前判断：
+Planner Agent 同时需要在规划前判断：
 
 - 当前视野中是否存在人手等危险物体。
 - 当前目标是否可定位。
@@ -172,20 +208,24 @@ Planner 同时需要在规划前判断：
 
 若任一条件不满足，则任务直接失败并触发告警。
 
-### 5.4 Coder
+### 5.4 Coder Agent
 
-Coder 负责将 Planner 输出的受控步骤转化为符合厂商 Python SDK 约束的执行脚本。
+Coder Agent 负责将 Planner Agent 输出的受控步骤，结合 Memory Layer 中的 SDK 约束、动作模板和示教知识，转化为结构化执行计划，并基于该计划渲染符合厂商 Python SDK 约束的执行脚本。
 
-MVP 中 Coder 的设计原则如下：
+Coder Agent 的标准输出命名为“可执行结构化计划”。它负责将 Planner Agent 的语义动作计划映射为执行级动作，例如 `move_j`、`move_l`、`gripper_open`、`gripper_close`、`wait`、`retreat` 等受控原语。
 
+MVP 中 Coder Agent 的设计原则如下：
+
+- 主产物必须是结构化执行计划，作为 Critic Agent、审计链路和执行层的主输入。
+- 渲染出的 SDK 脚本仅作为执行工件或展示工件，不作为独立主数据源。
 - 不允许自由生成任意 Python 脚本。
 - 必须限制在受控动作模板和厂商 SDK 白名单接口内。
 - 输出结果需具备可审计性，能够标记脚本版本、生成时间、关联任务 ID。
 - 每个动作步骤都应保留对应的输入参数和来源信息。
 
-### 5.5 Critic
+### 5.5 Critic Agent
 
-Critic 负责在执行前对计划和脚本进行校验。MVP 仅要求规则校验与轨迹检查，不做完整数字孪生。
+Critic Agent 负责在执行前对计划和脚本进行校验，并结合 Tool Layer 返回的环境事实、Memory Layer 提供的安全规则与任务约束做出放行决策。必要时，Critic Agent 可以请求补充 Tool 调用以获取额外事实依据。MVP 仅要求规则校验与轨迹检查，不做完整数字孪生。
 
 校验内容包括：
 
@@ -197,7 +237,7 @@ Critic 负责在执行前对计划和脚本进行校验。MVP 仅要求规则校
 - 基础防碰撞检查。
 - 夹爪动作是否符合当前任务阶段约束。
 
-Critic 的校验结果必须结构化输出，至少包括：
+Critic Agent 的校验结果必须结构化输出，至少包括：
 
 - 是否允许运行。
 - 失败类别。
@@ -205,15 +245,22 @@ Critic 的校验结果必须结构化输出，至少包括：
 - 关联步骤。
 - 建议回退模块。
 
-若校验失败，系统不执行脚本，并记录为失败任务。
+若校验失败，编排器按以下规则决定回退：
+
+- 参数绑定错误、模板映射错误、脚本渲染错误，优先回退到 `Coder Agent`。
+- 任务理解错误、动作顺序错误、安全前提不成立，优先回退到 `Planner Agent`。
+- 一次完整的 `Planner Agent -> Coder Agent -> Critic Agent` 处理链路算作一次内部循环；Critic Agent 补充请求 Tool 不单独计数。
+- 单次任务内部循环最多允许 3 次，超过上限后任务失败，并输出用户可读失败结论。
+
+若校验失败且不可恢复，系统不执行脚本，并记录为失败任务。
 
 ### 5.6 RobotTool
 
-RobotTool 是对机械臂底层执行能力的封装层，MVP 通过厂商 Python SDK 直连。
+RobotTool 是 `Tool Layer` 中面向执行的能力封装。是否进入执行阶段由 Agent 产物和 Critic Agent 放行结果共同决定，Orchestrator 在通过权限校验与安全门禁后负责将执行请求路由到底层 SDK。RobotTool 不接受来自 Agent 的直接执行指令。
 
 RobotTool 需要负责：
 
-- 接收通过校验的脚本或动作计划。
+- 接收通过校验的可执行结构化计划或其渲染脚本。
 - 以受控方式调用厂商 SDK。
 - 输出结构化执行状态。
 - 捕获底层异常并映射为统一错误码。
@@ -230,7 +277,20 @@ RobotTool 需要返回的状态至少包括：
 - `Execution_Interrupted`
 - `Emergency_Stop`
 
-### 5.7 RAG 与记忆
+### 5.7 Agent Memory：RAG 与记忆
+
+RAG、短期记忆和长期记忆不是脱离 Agent 的独立后台模块，而是 Agent Runtime 中的 `Memory Layer`。编排器负责在 Planner Agent、Coder Agent、Critic Agent 启动前装配检索结果与任务上下文，并在任务结束后决定是否回写长期记忆。
+
+Memory Layer 的读取优先级固定为：
+
+- 安全规则。
+- 机械臂配置与硬约束。
+- SDK 白名单。
+- SOP。
+- 示教样本。
+- 长期记忆。
+
+低优先级信息不得覆盖高优先级硬约束。
 
 #### 知识库范围
 
@@ -240,11 +300,11 @@ MVP 的知识来源限定为：
 - 作业 SOP。
 - 人工示教样本。
 
-知识库的目的不是开放问答，而是为任务规划与脚本生成提供约束和参考。
+知识库的目的不是开放问答，而是作为 Agent Memory 的检索来源，为任务规划、脚本生成与校验提供约束和参考。
 
 #### 短期记忆
 
-短期记忆用于保存当前任务上下文，例如：
+短期记忆用于保存当前任务上下文，供三个 Agent 在单次任务生命周期内共享，例如：
 
 - 当前任务输入。
 - 当前工位环境状态。
@@ -254,12 +314,14 @@ MVP 的知识来源限定为：
 
 #### 长期记忆
 
-长期记忆用于保存经过验证的成功经验，仅在视觉复检成功后写入。每条经验至少包含：
+长期记忆用于保存经过验证的成功经验，仅在 VisionTool 复检成功后由编排器触发写入。每条经验至少包含：
 
 - 经验 ID。
 - 关联任务 ID。
 - 任务类型。
 - 目标物类型。
+- 工位或场景标识。
+- 机械臂配置标识。
 - 关键抓取参数。
 - 放置参数。
 - 关联脚本版本。
@@ -269,6 +331,12 @@ MVP 的知识来源限定为：
 
 失败任务不得写入长期记忆。
 
+长期记忆默认读取策略固定为：
+
+- 先按 `工位/场景 + 任务类型 + 目标物类型 + 机械臂配置` 做元数据过滤。
+- 再基于任务上下文做相似度排序。
+- 默认返回 `top 5` 结果供 Agent 参考。
+
 ## 6. 业务流程设计
 
 ### 6.1 端到端主流程
@@ -276,15 +344,17 @@ MVP 的知识来源限定为：
 1. 操作员在 Web 控制台创建任务。
 2. 系统创建任务记录并分配 `task_id`。
 3. 系统加载当前激活机械臂配置和安全规则。
-4. 系统从知识库中检索相关 SOP、SDK 约束和示教样本。
-5. VisionTool 执行目标定位并返回视觉结果。
-6. Planner 生成受控动作步骤。
-7. Coder 生成受控 SDK 脚本。
-8. Critic 执行规则校验与轨迹检查。
-9. 若校验通过，RobotTool 自动执行。
-10. 执行完成后，VisionTool 再次验证结果。
-11. 若视觉确认成功，则任务完成并写入长期记忆。
-12. 若执行失败或视觉确认失败，则任务失败、立即停机并生成告警。
+4. `Executor Worker / Orchestrator` 装配 Agent 上下文，包括知识检索结果、短期记忆和当前任务配置。
+5. Planner Agent 基于用户指令和初始上下文判断是否需要调用 VisionTool 等 Tool。
+6. 若 Agent 发起 Tool 请求，Orchestrator 路由对应 Tool 调用，并将结构化结果回填到 Agent 上下文。
+7. Planner Agent 基于补全后的上下文生成受控动作步骤。
+8. Coder Agent 基于受控步骤与 Memory Layer 中的 SDK 约束生成结构化执行计划，并渲染受控 SDK 脚本。
+9. Critic Agent 结合规则、轨迹约束和工具返回事实执行校验，必要时可再次请求补充 Tool 调用。
+10. 若校验失败且属于可回退问题，编排器按问题类型回退到 Coder Agent 或 Planner Agent，单任务最多允许 3 次内部循环。
+11. 若校验通过，Orchestrator 将已放行的执行请求路由到 RobotTool 执行。
+12. 执行完成后，相关 Agent 发起 VisionTool 复检请求，Orchestrator 路由调用并回填结果。
+13. 若视觉确认成功，则任务完成并通过 Memory Layer 写入长期记忆。
+14. 若执行失败或视觉确认失败，则任务失败、立即停机并生成告警。
 
 ### 6.2 失败处理流程
 
@@ -334,8 +404,8 @@ MVP Web 控制台建议包含以下页面：
 - 目标物与目标位置。
 - 当前机械臂配置。
 - 视觉定位结果。
-- 动作计划步骤。
-- 生成脚本摘要。
+- 语义动作计划。
+- 可执行结构化计划与脚本摘要。
 - 校验结果。
 - 实际执行结果。
 - 视觉复检结果。
@@ -343,6 +413,8 @@ MVP Web 控制台建议包含以下页面：
 - 告警与失败原因。
 
 ## 8. 对象模型与接口设计
+
+在对象命名约定上，Planner Agent 的产物称为“语义动作计划”，Coder Agent 的产物称为“可执行结构化计划”。MVP 当前对外主接口以 Coder Agent 产出的可执行结构化计划为准。
 
 ### 8.1 任务对象
 
@@ -362,18 +434,20 @@ MVP Web 控制台建议包含以下页面：
 
 ### 8.2 执行计划对象
 
+执行计划对象是 Coder Agent 的主产物，也是 Critic Agent 和执行层的主输入。SDK 脚本或脚本摘要仅是该对象的渲染工件，不作为独立主数据源。该对象即“可执行结构化计划”。
+
 执行计划对象至少包含以下字段：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `plan_id` | string | 计划唯一标识 |
 | `task_id` | string | 关联任务 |
-| `steps` | array | 步骤序列 |
-| `action_params` | array | 每步动作参数 |
+| `steps` | array | 执行级受控动作序列 |
+| `action_params` | array | 与执行级动作一一对应的参数 |
 | `preconditions` | array | 前置条件 |
-| `validation_result` | object | 校验结果 |
+| `validation_result` | object | Critic Agent 输出的校验结果 |
 | `allowed_to_run` | boolean | 是否允许运行 |
-| `script_version` | string | 生成脚本版本 |
+| `script_version` | string | 由执行计划渲染出的脚本版本 |
 
 ### 8.3 执行结果对象
 
@@ -402,6 +476,7 @@ MVP 接口按职责分组如下：
 
 #### 计划与脚本接口
 
+- 查询语义动作计划
 - 查询执行计划
 - 查询脚本摘要
 - 查询校验结果
@@ -461,13 +536,16 @@ MVP 必须支持完整审计追踪。每一次任务至少记录以下链路：
 
 - 谁在什么时间提交了什么指令。
 - 系统解析出了什么任务目标。
-- 系统加载了哪些知识条目和示教样本。
-- Planner 产出了什么步骤。
-- Coder 产出了哪个脚本版本。
-- Critic 做了哪些校验以及结果如何。
+- 编排器装配了哪些知识条目、短期记忆上下文和示教样本。
+- 哪个 Agent 在什么阶段请求了什么 Tool，请求参数和返回结果如何。
+- Planner Agent 产出了什么步骤。
+- Coder Agent 产出了哪个脚本版本。
+- Critic Agent 做了哪些校验以及结果如何。
 - RobotTool 返回了什么执行状态。
-- VisionTool 给出了什么复检结果。
+- VisionTool 给出了什么观察与复检结果。
 - 是否写入长期记忆。
+
+审计日志不记录 Agent 原始推理全文，也不持久化 raw chain-of-thought。审计层仅记录输入摘要、上下文来源、prompt 或版本标识、结构化输出、Tool 调用记录和最终决策结果。
 
 审计日志应支持按任务 ID、时间、机器人 ID、任务状态进行检索。
 
@@ -485,16 +563,14 @@ MVP 采用单机部署，核心原因如下：
 
 ### 11.2 模块边界
 
-单机部署下建议保留以下逻辑模块：
+单机部署下建议保留以下运行时分层与逻辑模块：
 
 - Web Console
 - Task Service
-- Vision Module
-- Planner Module
-- Coder Module
-- Critic Module
-- RobotTool Adapter
-- Knowledge & Memory Service
+- Orchestrator Layer：Executor Worker / Orchestrator
+- Agent Layer：BaseAgent / Planner Agent / Coder Agent / Critic Agent
+- Tool Layer：VisionTool Adapter / RobotTool Adapter
+- Memory Layer：Knowledge Retrieval / Short-Term Memory / Long-Term Memory
 - Audit & Alert Service
 
 ### 11.3 后续演进方向
@@ -503,6 +579,7 @@ MVP 采用单机部署，核心原因如下：
 
 - `Vision Service` 独立部署到感知算力节点。
 - `Agent Service` 独立部署到认知与控制节点。
+- `Memory Service` 独立部署到知识检索与经验沉淀节点。
 - 节点间通过 gRPC 等方式通信。
 
 该部分仅作为未来演进路线，不属于 MVP 实现前提。
@@ -544,11 +621,28 @@ MVP 采用单机部署，核心原因如下：
 
 ### 12.2 核心验收指标
 
-- 任务成功率。
-- 安全零事故。
-- 任务链路审计完整率。
-- 视觉确认覆盖率。
-- 失败任务拦截准确率。
+单工位验收范围限定为：
+
+- 单工位。
+- 单机械臂型号。
+- 固定相机位姿。
+- 固定目标物料集合。
+- 固定放置区域。
+- 固定光照条件。
+- 固定背景环境。
+- 允许人工复位场景。
+
+单工位验收指标如下：
+
+- 标准任务样本数为 `50`。
+- 目标物种类数为 `10`。
+- 每类目标物任务数量均衡，默认每类 `5` 个任务。
+- 任务成功率 `>= 85%`。
+- 安全事故数为 `0`。
+- 视觉复检覆盖率为 `100%`。
+- 失败任务拦截准确率 `>= 95%`。
+- 长期记忆写入正确率为 `100%`。
+- 单次任务端到端耗时 `P95 <= 60 s`。
 
 ## 13. 风险与缓解策略
 
@@ -562,8 +656,8 @@ MVP 采用单机部署，核心原因如下：
 
 ### 13.2 缓解策略
 
-- 通过动作模板和 SDK 白名单约束 Coder。
-- 通过 Critic 统一做规则校验与轨迹检查。
+- 通过动作模板和 SDK 白名单约束 Coder Agent。
+- 通过 Critic Agent 统一做规则校验与轨迹检查。
 - 通过立即停机策略兜底高风险异常。
 - 通过视觉复检决定是否写入长期记忆。
 - 通过完整审计日志支撑问题追查和规则迭代。
